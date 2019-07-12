@@ -23,61 +23,121 @@ import cats.data.Chain
 import model.{AttributeName, AttributeValue}
 import Schema.structure._
 
-case class ReadError() extends Exception
-
+/**
+  * A type class that provides a way to produce a value of type `A` from an [[AttributeValue]] instance.
+  */
 trait Decoder[A] {
-  def read(v: AttributeValue): Either[ReadError, A]
+
+  def apply(c: HCursor): Decoder.Res[A]
+
 }
+
 object Decoder {
-  def instance[A](f: AttributeValue => Either[ReadError, A]): Decoder[A] =
+
+  final type Res[A] = Either[ReadError, A]
+
+  def instance[A](f: HCursor => Res[A]): Decoder[A] =
     new Decoder[A] {
-      def read(v: AttributeValue) = f(v)
+      def apply(c: HCursor): Res[A] = f(c)
     }
 
   def fromSchema[A](s: Schema[A]): Decoder[A] = {
-    type Res[B] = Either[ReadError, B]
 
-    def decodeInt: AttributeValue => Res[Int] =
-      _.n.toRight(ReadError()).flatMap { v =>
-        Either.catchNonFatal(v.value.toInt).leftMap(_ => ReadError())
-      }
+    def decodeInt: HCursor => Res[Int] = { cursor =>
+      cursor.value.n
+        .toRight(
+          ReadError(
+            s"Expected value of type N but got ${cursor.value}",
+            cursor.history
+          )
+        )
+        .flatMap { n =>
+          Either
+            .catchNonFatal(n.value.toInt)
+            .leftMap(
+              _ =>
+                ReadError(s"Could not parse to Int: ${n.value}", cursor.history)
+            )
+        }
+    }
 
-    def decodeString: AttributeValue => Res[String] =
-      _.s.toRight(ReadError()).map(_.value)
+    def decodeString: HCursor => Res[String] = { cursor =>
+      cursor.value.s
+        .toRight(
+          ReadError(
+            s"Expected value of type S but got ${cursor.value}",
+            cursor.history
+          )
+        )
+        .map(_.value)
+    }
 
-    def decodeObject[R](
-        record: Ap[Field[R, ?], R],
-        v: AttributeValue.M
-    ): Res[R] =
-      record.foldMap {
-        λ[Field[R, ?] ~> Res] { field =>
-          v.values
-            .get(AttributeName(field.name))
-            .toRight(ReadError())
-            .flatMap { v =>
-              fromSchema(field.elemSchema).read(v)
+    def decodeObject[R](record: Ap[Field[R, ?], R]): HCursor => Res[R] = {
+      cursor =>
+        cursor.value.m
+          .toRight(
+            ReadError(
+              s"Expected value of type M but got ${cursor.value}",
+              cursor.history
+            )
+          )
+          .flatMap { v =>
+            record.foldMap {
+              λ[Field[R, ?] ~> Res] { field =>
+                v.values
+                  .get(AttributeName(field.name))
+                  .toRight(
+                    ReadError(
+                      s"Field not found: ${field.name}",
+                      cursor.history
+                    )
+                  )
+                  .flatMap { v =>
+                    val newCursor = HCursor
+                      .fromAttributeValue(v)
+                      .addOp(
+                        cursor,
+                        CursorOp.DownField(AttributeName(field.name))
+                      )
+                    fromSchema(field.elemSchema).apply(newCursor)
+                  }
+              }
+            }
+          }
+    }
+
+    implicit val monoidK: MonoidK[Res] = new MonoidK[Res] {
+      override def empty[B]: Res[B] =
+        Either.left(ReadError("", Nil))
+
+      override def combineK[B](x: Res[B], y: Res[B]): Res[B] =
+        x.orElse(y)
+    }
+
+    def decodeSum[B](cases: Chain[Alt[B]]): HCursor => Res[B] = { cursor =>
+      cursor.value.m
+        .toRight(
+          ReadError(
+            s"Expected value of type M but got ${cursor.value}",
+            cursor.history
+          )
+        )
+        .flatMap { _ =>
+          cases
+            .foldMapK[Res, B] { alt =>
+              fromSchema(alt.caseSchema)
+                .apply(cursor)
+                .map(alt.prism.inject)
             }
         }
-      }
-
-    def decodeSum[B](cases: Chain[Alt[B]], v: AttributeValue.M): Res[B] =
-      cases
-        .foldMapK { alt =>
-          fromSchema(alt.caseSchema).read(v).map(alt.prism.inject).toOption
-        }
-        .toRight(ReadError())
+    }
 
     s match {
       case Num => Decoder.instance(decodeInt)
       case Str => Decoder.instance(decodeString)
-      case Rec(rec) =>
-        Decoder.instance {
-          _.m.toRight(ReadError()).flatMap(decodeObject(rec, _))
-        }
-      case Sum(cases) =>
-        Decoder.instance {
-          _.m.toRight(ReadError()).flatMap(decodeSum(cases, _))
-        }
+      case Rec(rec) => Decoder.instance(decodeObject(rec))
+      case Sum(cases) => Decoder.instance(decodeSum(cases))
     }
   }
+
 }
