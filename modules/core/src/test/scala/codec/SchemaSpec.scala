@@ -46,12 +46,40 @@ class SchemaSpec extends UnitSpec {
   case class One(v: String) extends Same
   case class Two(v: String) extends Same
 
-  def test[A](schema: Schema[A], data: A, expected: AttributeValue) = {
-    def output = Encoder.fromSchema(schema).write(data).toOption.get
-    def roundTrip = Decoder.fromSchema(schema).read(output).toOption.get
+  def test[A](
+      schema: Schema[A],
+      data: A,
+      expected: AttributeValue
+  ): org.scalatest.Assertion = {
+    def output: AttributeValue =
+      Encoder.fromSchema(schema).write(data).toOption.get
+    def roundTrip: A =
+      Decoder
+        .fromSchema(schema)
+        .apply(HCursor.fromAttributeValue(output))
+        .toOption
+        .get
 
     assert(output == expected)
     assert(roundTrip == data)
+  }
+
+  def testDecodingFailure[A](
+      schema: Schema[A],
+      encodedData: AttributeValue,
+      expected: ReadError
+  ): org.scalatest.Assertion = {
+    def decodingFailure: ReadError =
+      Decoder
+        .fromSchema(schema)
+        .apply(HCursor.fromAttributeValue(encodedData))
+        .swap
+        .toOption
+        .get
+
+    // TODO Use === instead
+    assert(decodingFailure.message == expected.message)
+    assert(decodingFailure.playHistory == expected.playHistory)
   }
 
   "schema" should {
@@ -305,6 +333,134 @@ class SchemaSpec extends UnitSpec {
         test(doorSchema, closedDoor, expectedClosed)
         ()
       }
+    }
+
+    "report decoding failure due to wrong AttributeValue type" in {
+      val encodedUserId = AttributeValue.s("tim") // wrong attribute value type
+      val userIdSchema = Schema.num
+      val expectedReadErrorOnUserId = ReadError(
+        s"Expected value of type N but got $encodedUserId",
+        Nil
+      )
+      testDecodingFailure(
+        userIdSchema,
+        encodedUserId,
+        expectedReadErrorOnUserId
+      )
+
+      val encodedUserName = AttributeValue.n(203) // wrong attribute value type
+      val userNameSchema = Schema.str
+      val expectedReadErrorOnUserName =
+        ReadError(s"Expected value of type S but got $encodedUserName", Nil)
+      testDecodingFailure(
+        userNameSchema,
+        encodedUserName,
+        expectedReadErrorOnUserName
+      )
+    }
+
+    "report failure to find a field on a product" in {
+      val encodedRole = AttributeValue.m(
+        AttributeName("capability") -> AttributeValue.s("admin"),
+        AttributeName("user") -> AttributeValue.m(
+          AttributeName("identifier") -> AttributeValue
+            .n(203), // wrong field name
+          AttributeName("name") -> AttributeValue.s("tim")
+        )
+      )
+
+      val userSchema: Schema[User] = record[User] { field =>
+        (
+          field("id", num, _.id),
+          field("name", str, _.name)
+        ).mapN(User.apply)
+      }
+
+      val roleSchema: Schema[Role] = record[Role] { field =>
+        (
+          field("capability", str, _.capability),
+          field("user", userSchema, _.user)
+        ).mapN(Role.apply)
+      }
+
+      val expectedReadError = ReadError(
+        s"Field not found: id",
+        List(
+          CursorOp.DownField(AttributeName("user"))
+        )
+      )
+
+      testDecodingFailure(roleSchema, encodedRole, expectedReadError)
+    }
+
+    "report failure to decode a field on a product" in {
+      val encodedRole = AttributeValue.m(
+        AttributeName("capability") -> AttributeValue.s("admin"),
+        AttributeName("user") -> AttributeValue.m(
+          AttributeName("id") -> AttributeValue
+            .N("ABC"), // wrong attribute value type
+          AttributeName("name") -> AttributeValue.s("tim")
+        )
+      )
+
+      val userSchema: Schema[User] = record[User] { field =>
+        (
+          field("id", num, _.id),
+          field("name", str, _.name)
+        ).mapN(User.apply)
+      }
+
+      val roleSchema: Schema[Role] = record[Role] { field =>
+        (
+          field("capability", str, _.capability),
+          field("user", userSchema, _.user)
+        ).mapN(Role.apply)
+      }
+
+      val expectedReadError = ReadError(
+        s"Could not parse to Int: ABC",
+        List(
+          CursorOp.DownField(AttributeName("id")),
+          CursorOp.DownField(AttributeName("user"))
+        )
+      )
+
+      testDecodingFailure(roleSchema, encodedRole, expectedReadError)
+    }
+
+    "report last decoding failure on a sum" in {
+      val encodedDoor = AttributeValue.m(
+        AttributeName("state") -> AttributeValue.m(
+          AttributeName("ajar") -> AttributeValue.m() // wrong field name
+        )
+      )
+
+      val stateSchema: Schema[State] = {
+        val openSchema = record[Open.type] { field =>
+          field("open", emptyRecord, _ => ()).as(Open)
+        }
+        val closedSchema = Schema.record[Closed.type] { field =>
+          field("closed", emptyRecord, _ => ()).as(Closed)
+        }
+        Schema.oneOf[State] { alt =>
+          alt(openSchema) |+| alt(closedSchema)
+        }
+      }
+
+      val doorSchema = record[Door] { field =>
+        field("state", stateSchema, _.state).map(Door.apply)
+      }
+
+      // The error should be the one encountered in attempting to decode the last alternative
+      val expectedReadError =
+        ReadError(
+          "Field not found: closed",
+          List(
+            CursorOp.DownField(AttributeName("state"))
+          )
+        )
+
+      testDecodingFailure(doorSchema, encodedDoor, expectedReadError)
     }
   }
 
